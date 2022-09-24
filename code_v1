@@ -1,0 +1,286 @@
+#include <WiFi.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include "ThingSpeak.h"
+#include <ArduinoJson.h> //version 5
+#include "HTTPClient.h"
+#include "time.h"
+
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+#define OLED_RESET -1   //   QT-PY / XIAO
+Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+
+#define NUMFLAKES 10
+#define XPOS 0
+#define YPOS 1
+#define DELAY 2
+
+#define LOGO16_GLCD_HEIGHT 16
+#define LOGO16_GLCD_WIDTH  16
+
+#define i2c_Address 0x3c //initialize with the I2C addr 0x3C Typically eBay OLED's
+String iiit = "http://esw-onem2m.iiit.ac.in:443/~/in-cse/in-name/Team-15/WFM/Data0/";
+
+const char *apiKey = "BIFVSDQOLNPH6HFC"; // Enter your Write API key from ThingSpeak
+const char *ssid = "esw-m19@iiith";     // replace with your wifi ssid and wpa2 key
+const char *passphrase = "e5W-eMai@3!20hOct";
+String cse_ip = "192.168.8.54"; //51 YOUR IP from ipconfig/ifconfig
+String cse_port = "8080";
+String server = "http://" + cse_ip + ":" + cse_port + "/~/in-cse/in-name/";
+String accessid = "c2IhxG:ZJLo#X";
+String ae1 = "FlowRate";
+String ae2 = "TotalVolume";
+String cnt = "Node";
+String string;
+
+char   host[]      = "api.thingspeak.com"; // ThingSpeak address
+const int httpPort = 80;
+String url = "https://api.thingspeak.com/channels/1569738/feeds.json?results=1";
+const unsigned long HTTP_TIMEOUT = 10000;  // max respone time from server
+
+// ###################
+#define PUBLIC  // define this as PUBLIC or PRIVATE to access the channels as required by their security setting
+// ##################
+float last_volume = 0;
+
+WiFiServer Server(80);
+WiFiClient client;
+
+//unsigned long myChannelNumber = 1569738;
+unsigned long myChannelNumber = 1837528;
+#define SENSOR  14
+ 
+long currentMillis = 0;
+long previousMillis = 0;
+int interval = 1000;
+int lastUploaded = 0;
+int om2mInterval = 30000;
+boolean ledState = LOW;
+float calibrationFactor = 3.5;
+volatile byte pulseCount;
+byte pulse1Sec = 0;
+float flowRate;
+unsigned long flowMilliLitres;
+unsigned int totalMilliLitres;
+float flowLitres;
+float totalLitres;
+
+// NTP server to request epoch time
+const char* ntpServer = "asia.pool.ntp.org";
+const long  gmtOffset_sec = 19800;
+time_t     now;
+struct tm  ts;
+char       buf[80];
+
+// Variable to save current epoch time
+unsigned long epochTime; 
+
+void IRAM_ATTR pulseCounter()
+{
+  pulseCount++;
+}
+
+ void createCI(String &val)
+{
+  HTTPClient http;
+  http.begin(iiit);
+  http.addHeader("X-M2M-Origin", accessid);
+  http.addHeader("Content-Type", "application/json;ty=4");
+  int code = http.POST("{\"m2m:cin\": {\"cnf\":\"application/json\",\"con\": " + String(val) + "}}");
+  Serial.println(code);
+  if (code == -1) {
+  Serial.println("Unable to connect (oneM2M)");}
+  http.end();
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(250); // wait for the OLED to power up
+  display.begin(i2c_Address, true); // Address 0x3C default
+  display.display();
+  delay(2000);
+  display.clearDisplay();
+
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, passphrase);
+  while (WiFi.status() != WL_CONNECTED) 
+  {
+  delay(500);
+  Serial.print(".");
+  }
+  
+  // Print local IP address and start web server
+  Serial.println("");
+  Serial.println("WiFi connected.");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+  Server.begin();
+  
+  ThingSpeak.begin(client); // Initialize ThingSpeak
+
+  pinMode(SENSOR, INPUT_PULLUP);
+ 
+  pulseCount = 0;
+  flowRate = 0.0;
+  flowMilliLitres = 0;
+  totalMilliLitres = 0;
+  previousMillis = 0;
+ 
+  attachInterrupt(digitalPinToInterrupt(SENSOR), pulseCounter, FALLING);
+  configTime(gmtOffset_sec, 0, ntpServer);
+
+  RetrieveTSChannelData();
+}
+ 
+void loop()
+{
+  currentMillis = millis();
+//  Serial.println(currentMillis);
+  if (currentMillis - previousMillis > interval) 
+  {
+    
+    pulse1Sec = pulseCount;
+    pulseCount = 0;
+
+    time(&now);
+    getLocalTime(&ts);
+    strftime(buf, sizeof(buf), "%a %Y-%m-%d %H:%M:%S", &ts);
+    Serial.println(buf);
+    
+    flowRate = ((1000.0 / (millis() - previousMillis)) * pulse1Sec) / calibrationFactor;
+    previousMillis = millis();
+ 
+    // Divide the flow rate in litres/minute by 60 to determine how many litres have
+    // passed through the sensor in this 1 second interval, then multiply by 1000 to
+    // convert to millilitres.
+    flowMilliLitres = (flowRate / 60) * 1000;
+    flowLitres = (flowRate / 60);
+ 
+    // Add the millilitres passed in this second to the cumulative total
+    totalMilliLitres += flowMilliLitres;
+    totalLitres += flowLitres;
+    
+    // Print the flow rate for this second in litres / minute
+    Serial.print("Flow rate: ");
+    Serial.print(flowRate);  // Print the integer part of the variable
+    Serial.print("L/min");
+    Serial.print("\t");       // Print tab space
+//    printFlow(int(flowRate));
+    
+    // Print the cumulative total of litres flowed since starting
+    Serial.print("Output Liquid Quantity: ");
+    Serial.print(totalMilliLitres+last_volume*1000);
+    Serial.print("mL / ");
+    Serial.print(totalLitres+last_volume);
+    Serial.println("L");
+    printFlow(float(flowRate),  float(totalLitres+last_volume));
+    
+  }
+  if(currentMillis - lastUploaded >= om2mInterval)
+  {
+    time(&now);
+    getLocalTime(&ts);
+    strftime(buf, sizeof(buf), "%a %Y-%m-%d %H:%M:%S", &ts);
+//    Serial.println(buf);
+    ThingSpeak.setField(1, flowRate);
+    ThingSpeak.setField(2, totalLitres+last_volume);
+    string = "[" + String(buf) + ", " + String(flowRate) + ", " + String(totalLitres+last_volume) + "]";
+    String string2 = "\"" + string + "\"";
+    createCI(string2);
+    int x = ThingSpeak.writeFields(myChannelNumber, apiKey);
+    if(x == 200)
+    {
+    Serial.println("Channel update successful.");
+    }
+    else{
+    Serial.println("Problem updating channel. HTTP error code " + String(x));
+    }
+    lastUploaded = millis();
+  }
+
+}
+
+void printFlow(float a, float b) {
+  display.clearDisplay();
+
+  display.setTextSize(1);      // Normal 1:1 pixel scale
+  display.setTextColor(SH110X_WHITE); // Draw white text
+  display.setCursor(0, 0);     // Start at top-left corner
+  display.cp437(true);         // Use full 256 char 'Code Page 437' font
+  display.print("Disney Princesses\n\n");
+  display.print("FlowRate(L/min):\n");
+  // Not all the characters will fit on the display. This is normal.
+  // Library will draw what it can and the rest will be clipped.
+  display.print(a);
+  display.print("\n\nVolume(L):\n");
+  display.print(b);
+  display.display();
+//  delay(500);
+}
+
+void RetrieveTSChannelData() {  // Receive data from Thingspeak
+  static char responseBuffer[3*1024]; // Buffer for received data
+  client = Server.available(); 
+  if (!client.connect(host, httpPort)) { 
+    Serial.println("connection failed"); 
+    return; 
+  }
+  client.print(String("GET ") + url + " HTTP/1.1\r\n" + "Host: " + host + "\r\n" + "Connection: close\r\n\r\n");
+//  Serial.println("\n\r"+String("GET ") + url + " HTTP/1.1\r\n" + "Host: " + host + "\r\n" + "Connection: close\r\n\r\n");
+  while (!skipResponseHeaders());                      // Wait until there is some data and skip headers
+  while (client.available()) {                         // Now receive the data
+    String line = client.readStringUntil('\n');
+    if ( line.indexOf('{',0) >= 0 ) {                  // Ignore data that is not likely to be JSON formatted, so must contain a '{'
+      Serial.println(line);                            // Show the text received
+      line.toCharArray(responseBuffer, line.length()); // Convert to char array for the JSON decoder
+      decodeJSON(responseBuffer);                      // Decode the JSON text
+    }
+  }
+  client.stop();
+}
+
+bool skipResponseHeaders() { 
+  char endOfHeaders[] = "\r\n\r\n"; // HTTP headers end with an empty line 
+  client.setTimeout(HTTP_TIMEOUT); 
+  bool ok = client.find(endOfHeaders); 
+  if (!ok) { Serial.println("No response or invalid response!"); } 
+  return ok; 
+} 
+
+bool decodeJSON(char *json) {
+  StaticJsonBuffer <3*1024> jsonBuffer;
+  char *jsonstart = strchr(json, '{'); // Skip characters until first '{' found and ignore length, if present
+  if (jsonstart == NULL) {
+    Serial.println("JSON data missing");
+    return false;
+  }
+  json = jsonstart;
+  JsonObject& root = jsonBuffer.parseObject(json); // Parse JSON
+//  deserializeJson(jsonBuffer, json);
+//  JsonObject root = jsonBuffer.to<JsonObject>();
+  if (!root.success()) {
+    Serial.println(F("jsonBuffer.parseObject() failed"));
+    return false;
+  }
+  JsonObject& root_data = root["channel"]; // Begins and ends within first set of { }
+  String id   = root_data["id"];
+  String name = root_data["name"];
+  String field2_name = root_data["field2"];
+//  String datetime    = root_data["updated_at"];
+//  Serial.println("\n\n Channel id: "+id+" Name: "+ name);
+//  Serial.println(" Readings last updated at: "+datetime);
+  
+    JsonObject& channel = root["feeds"][0]; // Now we can read 'feeds' values and so-on
+    String entry_id     = channel["entry_id"];
+    String field2value  = channel["field2"];
+    Serial.print(" Field2 entry number ["+entry_id+"] had a value of: ");
+    Serial.println(field2value);
+    last_volume = field2value.toFloat();
+}
